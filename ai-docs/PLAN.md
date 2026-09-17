@@ -15,7 +15,7 @@
 
 First public alpha target: bridge runs locally, ingests Qwen Code hook events into agenttrace daemon, ships tagged spans with `agent_provider="qwen_code"`. GigaCode support via wire contract (corporate agent implements GigaCode-specific handler in their own time).
 
-- **F-023. Bridge scaffold + wire contract** — repo bootstrap (this stage), wire-contract spec, zod schemas, translator skeleton, smoke test recipe. See umbrella `~/workspase/projects/opencode-workshop-stack/opencode-workshop/openspec/changes/archive/F-023-multi-source-ingestion/proposal.md` for the full cross-repo design.
+- **F-023. Bridge scaffold + wire contract** — repo bootstrap (this stage), wire-contract spec, zod schemas, translator skeleton, smoke test recipe. See umbrella `~/workspase/projects/agenttrace-stack/agenttrace/openspec/changes/archive/F-023-multi-source-ingestion/proposal.md` for the full cross-repo design.
 
 ## Active Features
 
@@ -78,7 +78,7 @@ First public alpha target: bridge runs locally, ingests Qwen Code hook events in
 - [x] Write `README.md` (minimal pointer)
 - [x] Write `AGENTS.md` (within-repo)
 - [x] Write `ai-docs/PLAN.md` (this file)
-- [ ] Update umbrella `~/workspase/projects/opencode-workshop-stack/AGENTS.md` to reference this repo
+- [ ] Update umbrella `~/workspase/projects/agenttrace-stack/AGENTS.md` to reference this repo
 - [ ] `git init` + first commit (requires Kolya's «приступай»)
 - [ ] Publish to npm `0.0.1` (after M1.5 smoke test, requires Kolya's `npm publish`)
 
