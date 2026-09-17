@@ -1,0 +1,60 @@
+{
+  "name": "@grudanov-nikolay/agenttrace-qwen-bridge",
+  "version": "0.0.0-dev",
+  "description": "Bridge that translates Qwen Code / GigaCode HTTP-hook events into the OpenCode-plugin wire format and POSTs them to the local agenttrace daemon on :5899.",
+  "license": "MIT",
+  "author": "Nikolai Grudanov (MIFI, M.Sc. 01.04.02) <grudanov.n.a@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nikolay-grudanov/agenttrace-qwen-bridge.git"
+  },
+  "homepage": "https://github.com/nikolay-grudanov/agenttrace-qwen-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/nikolay-grudanov/agenttrace-qwen-bridge/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "bin": {
+    "agenttrace-qwen-bridge": "dist/index.js"
+  },
+  "files": [
+    "dist/**",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "node --test tests/",
+    "lint": "tsc --noEmit",
+    "smoke": "node scripts/smoke-test.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "zod": "^3.23.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "keywords": [
+    "agenttrace",
+    "qwen-code",
+    "gigacode",
+    "opencode",
+    "otlp",
+    "otel",
+    "genai",
+    "debugger",
+    "tracing"
+  ]
+}
