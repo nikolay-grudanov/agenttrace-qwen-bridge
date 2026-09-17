@@ -1,6 +1,6 @@
 {
   "name": "@grudanov-nikolay/agenttrace-qwen-bridge",
-  "version": "0.0.0-dev",
+  "version": "0.0.2",
   "description": "Bridge that translates Qwen Code / GigaCode HTTP-hook events into the OpenCode-plugin wire format and POSTs them to the local agenttrace daemon on :5899.",
   "license": "MIT",
   "author": "Nikolai Grudanov (MIFI, M.Sc. 01.04.02) <grudanov.n.a@gmail.com>",
