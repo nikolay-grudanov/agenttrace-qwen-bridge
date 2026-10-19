@@ -157,7 +157,7 @@ New confirmed facts from `trace_2.json.txt`:
 - `ai-docs/PLAN.md` — title + Roadmap + F-023 description + F-024 entry
 
 **Out of scope:**
-- `ai-docs/specs/handoff/F-023-corporate-handshake.md` — historical handoff to the corporate GigaCode author dated 2026-09-17. References to `openworkshop-qwen-bridge` paths are part of the historical record and stay intact.
+- `ai-docs/specs/handoff/F-023-corporate-handshake.md` — archived to `ai-docs/specs/archive/F-023-corporate-handshake.md` (superseded by F-025 JSONL architecture, old paths and HTTP-hook design).
 - Remote push (`git remote add origin` + `git push`) — Kolya action.
 
 **Deferred to separate Kolya-authorized steps:**
