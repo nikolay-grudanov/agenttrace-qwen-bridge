@@ -11,158 +11,221 @@
 - **Order:** open Feature at the top of the file. Newest F-number first.
 - **Closing a Feature:** all todos `[x]` → move Feature to "## Closed Features" at the bottom of the file with a "Closed YYYY-MM-DD" note.
 
-## Roadmap (Tier 1, next-up) — 2026-09-18
+## Corpus — trace fixtures analysed to date (2026-10-20)
 
-Bridge runs locally under Qwen Code's interactive TUI. Each session starts → `SessionStart` hook spawns `bridge watch` → bridge reads JSONL events from a FIFO (`--json-file <fifo>` writes there in real time while the TUI renders on stdout) → translator converts to Workshop-spans → shipper POSTs to `localhost:5899/v1/` with `agent_provider="qwen_code"`.
+| Fixture | Source | Format | Events | What it proved |
+|---|---|---|---|---|
+| `test_trace_json_file.json` | bridge repo root | `--json-file` wire | 374 | Qwen 0.25.0 wire shape, `protocol_version=2`, `goal_state`, `control_request` |
+| `trace_1.json` | private-work-staff/json_ggcode | wire | 5403 | GigaCode 26.9.64, single schema w/ Qwen (D7) |
+| `trace_2.json.txt` | hermes attachment | wire | 12104 | `control_request`, MCP error, 15-agent batch, subagent output-file string |
+| `tetrace_mini_mcp.jsonl` | private-work-staff/json_ggcode | wire | 18 | mid-stream window (no `stream_event`) |
+| `trace_mini_agents_tools.jsonl` | private-work-staff/json_ggcode | wire | 41 | **session_id switch on resume**, async `agent` + `<task-notification>` |
+| `trace_3_p{1,2,3}.json` | private-work-staff/json_ggcode | wire | 1500/102/50 | permission_denied shape, GigaCode 26.10.6 |
+| `~/.qwen/projects/<slug>/chats/3d983425-….jsonl` | Kolya's machine | **session log** | 196 | 🔑 the transcript format (see F-026) |
+| `~/.qwen/projects/<slug>/subagents/3d983425-…/agent-*.jsonl` ×4 + `.meta.json` | Kolya's machine | **session log** | 25/25/31/21 | 🔑 sub-agent internals live in separate files, with parent link |
+| `~/.qwen/projects/<slug>/chats/3d983425-….runtime.json` | Kolya's machine | sidecar JSON | — | `pid`, `hostname`, `started_at`, `work_dir`, `qwen_version` |
 
-- **F-025 (this). Architecture flip — JSON-stream primary, SessionStart-hook wrapper.** See "Decisions" below.
-- **F-023.** Wire contract + zod schemas + translator + shipper + `bridge watch`/`bridge tail` + `bridge install` settings.json patcher. Implementation blocked on Kolya sending real gigacode.jsonl + qwen.jsonl fixture files (with sub-agent + error cases).
-- **F-024 (closed-pending).** Stack rename (`openworkshop-qwen-bridge` → `agenttrace-qwen-bridge`). Git init + first commit still pending Kolya's «приступай».
+**Two distinct formats exist.** `--json-file` (the "wire" format) is the *stream* serialization (Anthropic-style `stream_event` deltas, `control_request`, `session_start`/`session_end`). The `chats/*.jsonl` session log is the *persistence* format (Gemini-style `parts`, `parentUuid` DAG, `toolCallResult`, per-sideagent files). F-026 picks the persistence format as the bridge's ingest source. See `ai-docs/specs/F-026-session-log-format.md`.
+
+## Roadmap (Tier 1, next-up) — 2026-10-20
+
+- **F-026 (this). Transport redesign — tail the session log, not `--json-file` + FIFO.** Supersedes D2/D3. See below.
+- **F-025.** Wire contract + zod + translator + shipper + `bridge watch`/`tail` + `bridge install`, now **scoped to the F-026 session-log format**. Implementation is unblocked at the schema level; blocked on 4 open questions (bottom of file).
+- **F-024 (closed-pending).** Stack rename. `git init` + first commit still pending Kolya's «приступай».
 
 ## Active Features
 
-### F-025 — Architecture: JSON-stream bridge with SessionStart-hook auto-attach
+### F-026 — Transport: read the session log (`chats/*.jsonl`) instead of `--json-file` + FIFO
 
-**Context:** 2026-09-18 architecture session with Kolya. Originally F-023 was designed as an HTTP-hook bridge (`:5898` receiving `PreToolUse`/`PostToolUse`/`Stop`/`SubagentStop` from Qwen Code's hook system). Smoke-testing on Kolya's machine revealed two problems:
+**Context (2026-10-20):** After the 2026-09-18 architecture flip (F-025 D2/D3), the design assumed the bridge must create a FIFO because the `SessionStart` hook cannot tell it where Qwen writes its JSON stream. That assumption is **wrong**. Two discoveries:
 
-1. **Qwen Code is run only in interactive TUI mode** — headless `-y -o stream-json` was a wrong assumption. The native dual-output mode (`--json-file` / `--json-fd`) IS the right mechanism for TUI: TUI renders on stdout, JSON events stream to the file/fifo/fd in parallel.
-2. **HTTP hooks require `settings.json` editing + `allowPrivateNetworkHooks` opt-in** (per `https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/`). Setup friction.
+1. **Qwen always persists a per-session JSONL session log** at `~/.qwen/projects/<cwd-slug>/chats/<session-uuid>.jsonl`, and the `SessionStart` hook delivers its absolute path on stdin as `transcript_path`. No `--json-file`, no mkfifo, no `--json-fd` wrapper, works identically on `startup` / `resume` / `clear` / `compact`.
+2. **The session-log format is strictly richer than the `--json-file` wire format** — see the comparison table below. Choosing the wire format was choosing the worse source.
 
-Kolya proposed: **let `SessionStart` hook auto-attach the bridge** so there's zero per-session setup. Decision: dual-mode CLI (`bridge watch` for SessionStart-hook auto-attach + `bridge tail` for manual invocation), JSON-stream is the only ingest path (HTTP-bridge deferred indefinitely — only the corporate GigaCode fork without TUI would need it).
+**Why the session log wins:**
 
-**Awaiting fixtures from Kolya (BLOCKER — no code before this):**
+| Capability | `--json-file` wire | `chats/*.jsonl` session log |
+|---|---|---|
+| `parentUuid` (event DAG → span parenting) | ❌ absent | ✅ every event |
+| ISO `timestamp` per event | ❌ absent | ✅ every event |
+| Tool result body | `{tool_use_id, is_error, content:string}` — lossy | `toolCallResult{callId,status,executionStatus,resultDisplay}` — **typed union**: `shell_result{exitCode,signal,pid,outcome,output,error,notices,truncated}`, `fileDiff`, `task_execution`, `ask_user_question_answers`, string |
+| Token accounting | only in `stream_event.message_start` | `usageMetadata{promptTokenCount,candidatesTokenCount,thoughtsTokenCount,totalTokenCount,cachedContentTokenCount}` + `contextWindowSize` on every assistant turn |
+| Sub-agent internals | ❌ not in stream | ✅ `subagents/<sid>/agent-<type>-<toolUseId>.jsonl` + `.meta.json` sidecar |
+| Parent→sub-agent link | string in prose | `meta.parentSessionId` + `meta.toolUseId` + `meta.parentAgentId` |
+| Session liveness | ❌ | ✅ `chats/<sid>.runtime.json{schema_version,pid,session_id,work_dir,hostname,started_at,qwen_version}` |
+| `control_request` / `permission` | ✅ present | ❌ absent |
+| Reasoning deltas (`thinking_delta`) | ✅ present | ❌ only finalised `parts[{text, thought:true}]` |
+| `model`, `cwd`, `version`, `gitBranch` per event | only in `session_start` | ✅ on every event |
+| Noise to filter | low | `system` subtypes `ui_telemetry` (132/196!), `file_history_snapshot`, `attribution_snapshot`, `slash_command` |
 
-The whole bridge implementation depends on knowing the **exact** JSONL shapes Qwen Code 0.23.4 and the GigaCode fork emit. Two real interactive-TUI session traces are required. Both must be **unredacted** (full tool_input bodies, full tool_result contents, full model reasoning where present). Place them as attachments in this chat or commit them under `tests/fixtures/` once the repo is git-initialised.
-
-**Fixture 1 — `qwen.jsonl`** (interactive TUI session, captured via `--json-file /tmp/x.jsonl`):
-- Must contain `system/init` (or `session_start`) event with full `cwd`, `tools[]`, `mcp_servers`, `model`, `qwen_code_version`, `agents[]`.
-- Must contain ≥ 1 assistant turn with `thinking` content blocks (so we can model reasoning spans correctly).
-- Must contain ≥ 1 `tool_use` event whose `input` is non-trivial (≥ 1 KB), and the matching `tool_result` (success or error).
-- Must contain ≥ 1 sub-agent invocation (`tool_use.name == "agent"` or `task` or similar) — full input prompt + the full child session's events. This is the **only** way to validate `parent_tool_use_id` nesting for sub-agent spans.
-- Must contain ≥ 1 tool error: `tool_result.is_error == true` or `result.is_error == true`, to validate F-013 `status=ERROR` mapping in Workshop.
-- Ideally 5–20 minutes of real work, not a smoke test — long enough that we see a full assistant message stream (`stream_event` chunks) interleaved with `assistant` finalised blocks.
-
-**Fixture 2 — `gigacode.jsonl`** (corporate GigaCode fork, same capture method):
-- Same content requirements as fixture 1.
-- Specifically confirm or correct the field-shape differences already observed in Kolya's screenshot (IMG_0621.jpeg): `type:"session_start"` (vs Qwen `system/init`), `type:"assistant"` with `message.content[].type` set to `thinking` / `text` / `tool_use`, `type:"user"` for `tool_result`, `type:"result"` with `duration_ms`.
-- If `parent_tool_use_id` is absent or differently positioned in sub-agent events, document the exact shape so `src/wire-format.ts` zod schema can be written without guessing.
-- If `session_id` format differs from Qwen's UUIDv4, document it (GigaCode may use the shorter `25102` form from the screenshot — to be confirmed).
-
-**Why these exact requirements:**
-- Without sub-agent trace: translator will work for top-level only and need a rewrite the first time a sub-agent is hit live.
-- Without tool error trace: F-013 status mapping ships broken; you'll see all Qwen runs as `status=SUCCESS` even when tools crash.
-- Without full assistant turn (`thinking` + multiple `text` + `tool_use` blocks in one event): we'll have to guess span boundaries for reasoning vs prose.
-- Without `cwd` / `model` / `agents[]`: `runs.metadata` will be incomplete, UI badges will be missing labels.
-
-**Once fixtures are received:**
-1. First commit `tests/fixtures/qwen.jsonl` + `tests/fixtures/gigacode.jsonl` (Kolya redacts any secrets — or confirms full-file is OK to commit).
-2. Then walk through each todo below in order, with zod schemas asserted against the fixtures.
-
-**Partial fixture received 2026-09-22 from Kolya** (`~/workspase/projects/private-work-staff/json_ggcode/trace_1.json`, 1.6 MB, 5403 lines, gigacode session `26.9.64`, model `vip/GLM-5.3`, no secrets — Kolya confirmed OK to reference but not yet to commit to `tests/fixtures/`).
-
-Confirmed from `trace_1.json`:
-- ✅ Event shapes match the Qwen hypothesis (not the IMG_0621.jpeg screenshot guess): GigaCode **also** uses `{"type":"system","subtype":"session_start",...}` and `{"type":"system","subtype":"session_end",...}`. Single zod schema for both, not separate Qwen/GigaCode schemas.
-- ✅ `session_id` = UUIDv4 (`6cc302b9-0dc6-4eb8-97fc-1b42576b57b7`). Top-level field, also duplicated in `data.session_id`.
-- ✅ `parent_tool_use_id` present at top level but always `null` in this trace (top-level session, no in-flight sub-agent events).
-- ✅ Anthropic-style `stream_event`: `message_start`/`message_stop` (37/37) + `content_block_start`/`content_block_delta`/`content_block_stop` (75/5066/75). Index always 0/1 in this trace.
-- ✅ `assistant.message.content[]` blocks: `thinking` (with `thinking_delta` stream), `text`, `tool_use`.
-- ✅ `tool_use.input` is streamed via `stream_event` `input_json_delta` chunks then finalised in the `assistant` event — so translator must accumulate deltas to reconstruct full input.
-- ✅ `user.message.content[]` for `tool_result`: `{tool_use_id, is_error, content}` (string for permission denial, likely array for bash output).
-- ✅ `tool_use.id` format: `call_<32 hex chars>` (Anthropic-style, not UUID).
-- ✅ `model` can carry vendor prefix: `vip/GLM-5.3`. Shipper must preserve full string in `runs.metadata`.
-- ✅ Tool error case confirmed: `{"type":"user",...,"content":[{"type":"tool_result","tool_use_id":"call_...","is_error":true,"content":"Tool \"run_shell_command\" is denied: the tool's default permission is 'deny'."}]}`. F-013 status mapping should distinguish `permission_denied` from generic `runtime_error`.
-- ⚠️ `result` event **absent** in this TUI trace (0 events of `type:"result"`). Session finalisation comes from `system/session_end` instead. Translator must treat `system/session_end` as run-finalize, not `result`. **TO CONFIRM against Qwen 0.23.4** — does Qwen TUI also emit `result` events, or only `system/session_end`?
-- ⚠️ Sub-agent invocation seen (`tool_use.name:"agent"` with `subagent_type:"sa-developer-researcher"`, large `prompt`) but **child session events are NOT in this trace** — `session_end` came right after. Cannot validate `parent_tool_use_id` semantics inside the child session. **Need a second gigacode fixture where a sub-agent actually runs and returns.**
-
-**Second fixture received 2026-09-23 from Kolya** (`/home/gna/.hermes/webui/attachments/6d3ea12c9f3e/trace_2.json.txt`, 3.3 MB, 12104 lines, gigacode session `26.9.64`, model `vip/GLM-5.3`, main-session-id `7f7459ef-926a-4400-ac29-0acfe076be7f`, cwd `/home/work/20706056@sigma.sbrf.ru/projects/SA/ibp-digital-architecture`).
-
-New confirmed facts from `trace_2.json.txt`:
-- ✅ **`result` event STILL absent** (0/12104 lines). GigaCode TUI never emits `result` — session finalisation is exclusively `system/session_end`. Translator can rely on this. **Qwen 0.23.4 still to confirm** — might be different.
-- ✅ **`control_request` / `control_response` present** (2+2 events, lines 9269-9270). Subtype `can_use_tool`, fields `{request_id, request:{subtype, tool_name, tool_use_id, input, permission_suggestions[]}, blocked_path}`. Response `{response:{subtype:"success", request_id, response:{allowed: true|false}}}`. **Translator decision: ignore these for span emission** (they're permission dialogs, not actual work) but log `permission_denied` when `allowed:false`. If a Qwen fixture shows `control_request` followed by tool denial without further events — that's how F-013 `permission_denied` reason gets inferred.
-- ⚠️ **Sub-agent events MAY OR MAY NOT interleave into the parent trace.** This is a **hypothesis, not a confirmed fact** — the only direct evidence is one tool_result content string (line 9280) saying `"Background agent launched successfully. output_file: /home/work/.../.gigacode/projects/<cwd-hash>/subagents/<main-session-id>/agent-<subagent_type>-<tool_use_id>.jsonl"`. We also observed: 15 `tool_use.name:"agent"` invocations (line 9267), but **0 events in this trace have non-null `parent_tool_use_id`** and **0 events have a different `session_id`**. This is consistent with sub-agent events living in a separate file, but it could ALSO be explained by: (i) the ping-test sub-agents returning too fast to emit any events between launch and result, or (ii) the parent trace simply not recording child events by design. **Kolya to verify** by running a long-running sub-agent and tailing both `~/.gigacode/projects/*/subagents/<sid>/agent-*.jsonl` AND the main trace simultaneously. Until then, design treats option (b) below as default (parent bridge sees only `tool_use` start + `tool_result` final return for each sub-agent invocation; sub-agent internals not visible).
-- ✅ **Multiple sub-agent types confirmed** in this trace: `general-purpose`, `sa-developer-antagonist`, `sa-developer-architect`, `sa-developer-asyncapi-writer`, `sa-developer-code-researcher`, `sa-developer-dbml-writer`, `sa-developer-dictionary-writer`, `sa-developer-mcp-writer`, `sa-developer-openapi-writer`, `sa-developer-researcher`, `sa-developer-reviewer`, `sa-developer-role-model-writer`, `sa-developer-system-func-writer`, `Explore`, `statusline-setup`. So `subagent_type` is free-form string, not enum.
-- ✅ **Tool error: second type confirmed** at line 9942: `{"is_error":true,"content":"MCP tool 'sa-git-clone' reported tool error for function call: {...\"isError\":true,\"errors\":[...]}"`. This is a **runtime MCP error** (vs trace_1's permission denial). Both error types come through the same `is_error:true` envelope — translator must parse `content` prefix to distinguish: starts with `"Tool \"X\" is denied:"` → `permission_denied`; starts with `"MCP tool 'X' reported tool error:"` or `"<X> tool error:"` → `runtime_error`.
-- ✅ **Batch parallel sub-agent invocation** — line 9267 has 15 tool_use blocks in ONE assistant message (one model turn launched all 15 sub-agents simultaneously). Bridge should NOT assume 1 tool_use per assistant turn.
-- ✅ **`todo_write` tool present** (4 calls in this trace, lines like 10298). Optional: span per todo_update, OR flatten to run-level task summary.
-- ✅ **`tool_use.input` empty object streamed as `partial_json:"{}"`** (line 10296: `delta.type:"input_json_delta", partial_json:"{}"`). Translator must handle empty-input deltas without crashing.
-- ⚠️ **`session_end` always last line** — confirmed (line 12103). No `result` between assistant-final message and `session_end`. Workshop run-finalize signal is unambiguous.
-
-**Decisions (with rationale):**
+**Decisions:**
 
 | # | Decision | Rationale |
 |---|---|---|
-| D1 | **JSON-stream is the only ingest mechanism.** No `src/server.ts` HTTP listener. | TUI + `--json-file` already gives us real-time full-fidelity events (LLM reasoning, text, tool I/O, sub-agent tree, tokens, duration). HTTP hooks give us only tool I/O. |
-| D2 | **FIFO is the primary transport** (regular file + `--resume` mutation is a footgun; FD-passing requires wrapper). | Documented in `qwen --help` as supported target for `--json-file`. Pairs naturally with `readline` on Node side. |
-| D3 | **`bridge watch` is auto-spawned by Qwen Code's `SessionStart` hook** (matcher `.*`, type `command`, stdin = JSON event, statusMessage visible in TUI). | Zero per-session setup. `bridge watch` reads `session_id` + `cwd` from stdin, mkfifos `/tmp/agenttrace-qwen/$SESSION_ID.fifo`, then immediately switches to `bridge tail` mode in-process. When Qwen exits, Qwen's session cleanup closes the FIFO; bridge detects EOF and exits. |
-| D4 | **Dual CLI surface** — `bridge watch` (stdin-JSON hook entrypoint) and `bridge tail <path>` (manual FIFO/file reader). Same translator underneath. | Lets us unit-test the file reader independently of the hook entrypoint. Also useful for replay from saved JSONL. |
-| D5 | **`bridge install` subcommand patches `~/.qwen/settings.json`** to register the `SessionStart` hook (with backup + interactive confirm). Plus documented snippet in `README.md` for manual copy-paste. | (c) best of both: easy for casual users, controllable for advanced users. |
-| D6 | **One `agent_provider` discriminator in shipper**: `"qwen_code"` for Qwen, `"gigacode"` for GigaCode. CLI `--provider` flag overrides auto-detection. Auto-detection source **not yet confirmed** against real fixtures — candidate fields: `system/session_start.data.version` prefix (`26.9.64` → gigacode; `0.23.x` → qwen_code), or stdin hook payload's `product_name`. | Per umbrella `openspec/config.yaml` HARD rule "OpenCode-only — never add Codex/Claude/Anthropic-specific code": we add `qwen_code` + `gigacode` providers, both forks of QwenLM/qwen-code, both hook-fork compatible. |
-| D7 | **Single JSONL schema for Qwen and GigaCode** (confirmed 2026-09-22 against `trace_1.json`). Both emit `{"type":"system","subtype":"session_start",...}` and `{"type":"system","subtype":"session_end",...}`. Initial guess (from truncated screenshot) that GigaCode used `type:"session_start"` without subtype was wrong. | Required to handle both Kolya's `qwen 0.23.4` and GigaCode fork. If a future Qwen or GigaCode release diverges, F-026 splits this decision. |
-| D8 | **TUI-only mode**. No `-y` headless path is planned. Live smoke requires Kolya's hands on a TUI. CI uses fixture files. | Kolya explicit: "В режиме сервера или в безгаловом не планируем запускать". |
-| D9 | **HTTP-bridge (`src/server.ts`, `:5898`) deferred indefinitely.** Only the corporate GigaCode fork without TUI would need it — not on Kolya's roadmap. | Don't write code we won't use. Re-add as F-026 only if/when corporate asks. |
-| D10 | **Sub-agent visibility default: parent-bridge-only.** The bridge sees each sub-agent invocation as one `tool_use` (start) + `tool_result` (final return) span pair in the parent trace. Sub-agent internals (sub-`tool_use`, sub-thinking, sub-tool-result) are NOT visible. Sub-agent `parent_tool_use_id` semantics and whether sub-agent events live in a separate file (`~/.gigacode/projects/<cwd-hash>/subagents/<sid>/agent-<type>-<id>.jsonl`) are HYPOTHESIS not confirmed — see fixture section "Partial fixture received 2026-09-22" ⚠️ entry. If Kolya verifies sub-agent events do live in separate files, F-026 adds option (a): bridge discovers and tails each new sub-agent file as it appears (requires cwd-hash knowledge + `fs.watch` on the subagents dir). | Minimal-bridge principle; deferred complexity unless requested. |
-| D11 | **Reverse-direction: ship to `:5899/v1/` (Workshop) using the OpenCode-plugin wire format** (proposal D3 from F-023 umbrella proposal still holds). | Zero Workshop-side adapter needed beyond the `agent_provider` field already in the F-023 plan. |
+| **D12** | **Ingest = tail `transcript_path` from the `SessionStart` hook payload.** `bridge watch` reads hook JSON from stdin, resolves `transcript_path`, and tails that regular file incrementally (offset-tracked, tolerant of truncation/rotation). | Removes FIFO + `--json-file` + wrapper entirely. Works on every `source` value. No `/tmp` litter, no dangling FIFOs. |
+| **D13** | **The session-log format is the canonical wire contract; the `--json-file` wire format is supported only as a *replay* format** for `bridge tail <fixture>` offline analysis. | Two formats = two zod modules: `src/session-log.ts` (canonical, v1) and `src/wire-jsonl.ts` (best-effort, used by `bridge replay`). Keeps F-023/F-025's fixture work usable without paying for it at runtime. |
+| **D14** | **`SubagentStart` / `SubagentStop` hooks are NOT needed.** The bridge derives sub-agent activity by tailing `~/.qwen/projects/<slug>/subagents/<sid>/agent-*.jsonl`. The `subagents/` directory is created **lazily** (verified: 30 of 30 other `~/.qwen/projects/*` dirs have no `subagents/`), so the bridge `fs.watch`es the project dir for `subagents/`, then that dir for `*.jsonl` appearing. Each `.meta.json` gives `parentSessionId` + `toolUseId` + `parentAgentId` + `createdAt`/`lastUpdatedAt`/`status` → exact parent-span attach and duration. | Fewer hooks to register, no reliance on a fork-specific hook event. Verified present in Qwen 0.25.0 on Kolya's machine. |
+| **D15** | **Sub-agent `toolCallResult` is `{callId, durationMs}` only** — 41/41 across the 4 fixture files, no output body. So sub-agent tool spans carry name + duration but **no result text**. The sub-agent's final answer is recovered from the parent stream's `<task-notification>` `<result>`. | Don't design around data that isn't persisted. |
+| **D16** | **Span correlation key = `callId`**, which is identical in `assistant.message.parts[].functionCall.id` (open) and `tool_result.toolCallResult.callId` (close). Sub-agent spans correlate via `meta.toolUseId`. | Uniform across both formats. |
+| **D17** | **The async `agent` tool must NOT be closed by its own `tool_result`.** `toolCallResult.resultDisplay` is `task_execution` and the `functionResponse.output` says `"Background agent launched successfully. task_id: <type>-<toolUseId> … result arrives as a <task-notification> … in a later turn"`. The real close signal is the later `user` event whose `message.parts[0].text` starts with `<task-notification>` and carries `<tool-use-id>`. Both Qwen and GigaCode emit identical text. **Closes the D10 hypothesis.** | Verified in both providers, 4/4 in each fixture set. |
+| **D18** | **Filter `system` subtypes.** Drop `ui_telemetry`, `file_history_snapshot`, `attribution_snapshot`; keep `slash_command`. The wire format has no equivalent noise but has `goal_state` (Qwen-only) — also dropped. | `ui_telemetry` is 67% of events in the fixture. |
+| **D19** | **`agent_provider` auto-detection = `version` semver major.** `0.x.y` → `qwen_code`; `2x.y.z` (≥ 20) → `gigacode`. Confirmed: Qwen `0.25.0`, GigaCode `26.9.64` / `26.10.6`. `protocol_version` (Qwen 2 / GigaCode 1) is a secondary signal. `--provider` CLI flag overrides. | `system/session_start.data.version` is the only provider signal in the wire format; `version` is on every event in the session log. Version-major is stable and needs no product-name field. |
 
-**Out of scope (this iteration):**
-- Any HTTP server (`src/server.ts`).
-- Any `handler-qwen.ts` / `handler-gigacode.ts` files that receive hook events via HTTP.
-- OTLP receiver in Workshop (umbrella F-025 — irrelevant once we're JSONL-only).
+**Session-log format spec (verified on `3d983425-2f1d-4980-b707-aaeb678b5a78.jsonl`, 196 events):**
 
-**Files to create (no code yet — Kolya will send fixtures first):**
-- `src/cli.ts` — commander-style bin with subcommands `watch`, `tail`, `install`, `uninstall`.
-- `src/session-watch.ts` — `SessionStart` hook stdin reader, mkmfifo, hands off to `tail` mode.
-- `src/tail.ts` — readline by line over FIFO/file, zod-validate, call translator.
-- `src/translator.ts` — pure function: 1 JSONL event → 1 or 0 Workshop spans.
-- `src/wire-format.ts` — zod schemas for both Qwen event shapes (`{type:"system",subtype:"init"}` and `{type:"session_start"}`) and the common internal shape.
-- `src/shipper.ts` — POST to `localhost:5899/v1/` with backoff on 429.
-- `src/config.ts` — env-var loader (`BRIDGE_PORT` reserved for future HTTP, `WORKSHOP_URL` with `isLocalUrl()` guard from F-005 plugin pattern).
-- `src/logger.ts` — leveled logger.
-- `src/install.ts` — patches `~/.qwen/settings.json` with backup + dry-run mode.
-- `tests/wire-format.test.ts` — round-trip: both Qwen-shape fixtures → zod → common shape.
-- `tests/translator.test.ts` — each event type produces correct Workshop-span.
-- `tests/tail.test.ts` — synthetic FIFO + assert line-by-line shipper invocation (mocked).
-- `tests/shipper.test.ts` — backoff on 429, env-var hardening (no `WORKSHOP_URL=evil.com`).
-- `ai-docs/specs/F-025-wire-contract.md` — JSONL event shapes + translator mapping table (replaces the "HTTP wire contract" place from F-023).
-- `README.md` — install / `bridge install` / `bridge tail` example / `~/.qwen/settings.json` snippet.
-- `.github/workflows/ci.yml` — `tsc --noEmit` + `node --test` against fixtures.
+```
+Event envelope (all types):
+  uuid       string UUIDv4        ← dedup key (resume replay re-emits)
+  parentUuid string UUIDv4|null   ← DAG edge → span parent
+  sessionId  string UUIDv4        ← parent session (subagent files carry the PARENT id)
+  timestamp  string ISO-8601 Z    ← duration math
+  type       'system'|'user'|'assistant'|'tool_result'
+  cwd, version ("0.25.0"), gitBranch
 
-**Todos (waiting on Kolya's fixtures before starting):**
-- [ ] **Kolya: send real `qwen.jsonl`** — interactive TUI session, includes 1+ sub-agent invocation and 1+ tool error (`is_error: true` in `tool_result`).
-- [ ] **Kolya: send real `gigacode.jsonl`** — same shape requirements, plus if `parent_tool_use_id` nesting differs from Qwen, document it.
-- [ ] **Kolya: verify sub-agent event visibility model.** Run a long-running sub-agent in TUI (e.g. one that takes >30s, not a ping-test), and simultaneously tail both `/path/to/main/trace.jsonl` AND `~/.gigacode/projects/<cwd-hash>/subagents/<sid>/agent-*.jsonl`. Report: (i) does the main trace get ANY events with non-null `parent_tool_use_id` while sub-agent runs? (ii) does the sub-agent file exist with JSONL events? (iii) does the sub-agent file have its own `system/session_start` or just bare events? This determines whether we ship option (b) parent-only (default) or add option (a) sub-agent tailed files in F-026.
-- [ ] (after fixtures) Write `src/wire-format.ts` zod schemas for both event shapes; round-trip tests green.
-- [ ] (after fixtures) Write `src/translator.ts`; unit tests on Kolya's fixtures.
-- [ ] (after fixtures) Write `src/tail.ts`; synthetic FIFO test.
-- [ ] (after fixtures) Write `src/shipper.ts`; mocked HTTP tests.
-- [ ] (after fixtures) Write `src/session-watch.ts`; spawn `tail` in-process.
-- [ ] (after fixtures) Write `src/install.ts`; dry-run + real-patch tests.
-- [ ] (after fixtures) Write `src/cli.ts` + wire all subcommands.
-- [ ] (after fixtures) Write `README.md` install/usage/example.
-- [ ] (after fixtures) Write `.github/workflows/ci.yml` (tsc + node --test on fixtures committed to repo).
-- [ ] Live smoke (Kolya in TUI): start `bridge tail /tmp/agenttrace-qwen/$SESSION.fifo` in tmux pane B → in pane A run `qwen --json-file /tmp/agenttrace-qwen/$SESSION.fifo` → verify `sqlite3 ~/.raindrop/raindrop_workshop.db "SELECT id, json_extract(metadata,'$.agent_provider') FROM runs ORDER BY last_updated_at DESC LIMIT 3"` shows `qwen_code`.
-- [ ] Live smoke (Kolya in TUI): same with `bridge install` first → no manual `bridge tail` invocation, runs go through automatically.
+system  + subtype ∈ {slash_command, attribution_snapshot, file_history_snapshot, ui_telemetry}
+        + systemPayload (object, shape per subtype)
+user    + message{role:'user', parts:[…]}  + promptId ("<sid>########<n>")   ← turn grouping
+        + [subtype + systemPayload + deliveredTurn]  ← system-injected user events (e.g. <task-notification>)
+assistant + message{role:'model', parts:[…]} + model + usageMetadata + contextWindowSize
+        + [agentRound, agentRunId]                    ← sub-agent files only
+tool_result + message{role:'user', parts:[{functionResponse:{id,name,response:{output}}}]}
+          + toolCallResult {callId, status, executionStatus, resultDisplay}
+          + [durationMs]                              ← sub-agent files: callId + durationMs ONLY (D15)
 
-**Cross-repo impact (unchanged from F-023):**
-- `agenttrace-opencode-plugin` — NO change.
-- `agenttrace` — minimal: read `agent_provider` field, UI source badge + facet (handled by umbrella workshop's F-023 Stages 4-5).
+parts item variants:
+  {text: string}                          ← plain prose
+  {text: string, thought: true}           ← reasoning (finalised; no deltas in this format)
+  {functionCall: {id, name, args}}        ← tool call; args fully materialised (no accumulation!)
+  {functionResponse: {id, name, response:{output: string}}}   ← echoed inside tool_result
+
+resultDisplay variants (discriminated by .type):
+  {type:'shell_result', version, directory, exitCode, signal, pid, outcome,
+   outputFiles[], output, text, error, notices[], truncated}
+  {type:'fileDiff', fileDiff: string}
+  {type:'task_execution', …}               ← the async `agent` launch
+  {type:'ask_user_question_answers', …}
+  string                                    ← plain text output (read_file etc.)
+
+Sidecars:
+  chats/<sid>.runtime.json  {schema_version, pid, session_id, work_dir, hostname, started_at, qwen_version}
+  subagents/<sid>/agent-<type>-<toolUseId>.jsonl
+  subagents/<sid>/agent-<type>-<toolUseId>.meta.json
+     {agentId, agentType, subagentName, description, parentSessionId, toolUseId, parentAgentId,
+      createdAt, lastUpdatedAt, status, isBackgrounded, resumeCount, depth, model, resolvedApprovalMode,
+      persistedCliFlags{model, authType, baseUrl, approvalMode, maxSubagentDepth:5, …}}
+```
+
+**Out of scope (F-026):** any HTTP listener (D1 holds); `control_request` handling (no equivalent in this format — see open question Q4).
+
+**Todos:**
+- [ ] Write `ai-docs/specs/F-026-session-log-format.md` — the canonical spec above + translator mapping table + the GigaCode-equivalence column left blank until Q2 lands.
+- [ ] `src/session-log.ts` — zod schemas for the 4 event types + `parts` + `resultDisplay` union. All `.passthrough()` (hook/format contracts are forward-extensible).
+- [ ] `tests/session-log.test.ts` — parse `chats/3d983425-*.jsonl` + all 4 `agent-*.jsonl` + all 4 `.meta.json`, assert 0 parse failures.
+- [ ] `src/subagents.ts` — `fs.watch` the project dir for lazy `subagents/` creation, then that dir for `*.jsonl`; emit sub-agent spans from the `.meta.json` sidecars.
+- [ ] `tests/subagents.test.ts` — synthetic dir tree, assert discovery order + parent attach by `toolUseId`.
+- [ ] Commit the fixture corpus into `tests/fixtures/` (blocked on Q8 — Kolya's permission).
+
+### F-025 — Architecture: JSON-stream bridge with SessionStart-hook auto-attach
+
+**Context:** 2026-09-18 architecture session with Kolya. Originally F-023 was an HTTP-hook bridge (`:5898`) receiving `PreToolUse`/`PostToolUse`/`Stop`/`SubagentStop`. Smoke-testing revealed (1) Qwen is TUI-only, (2) HTTP hooks need `settings.json` editing + `allowPrivateNetworkHooks`. Kolya proposed `SessionStart`-hook auto-attach for zero per-session setup.
+
+**Status 2026-10-20:** architecture accepted and extended by F-026. All D-decisions below stand **except D2 and D3**, which F-026 replaces with D12/D14. Fixture blockers are resolved for Qwen; 4 questions remain (see bottom of file).
+
+**Fixture 1 — `qwen.jsonl` — ✅ RESOLVED 2026-10-20.**
+Received as `test_trace_json_file.json` (203 KB, 374 events, Qwen **0.25.0**, `protocol_version=2`, session `3d983425-2f1d-4980-b707-aaeb678b5a78`, cwd = the bridge repo itself, model `MiniMax-M2.7-highspeed`). Type census: `system`2 / `user`24 / `stream_event`293 / `assistant`46 / `control_request`5 / `control_response`4.
+- ✅ `system/session_start` with `data` = `{cwd, protocol_version, session_id, supported_events, version}` **only** — no `tools[]`, no `mcp_servers`, no `agents[]`, no `model`. (`supported_events` = `["system","user","assistant","stream_event","result","control_request","control_response"]`.)
+- ✅ `system/session_end` with `data` = `{session_id}` only.
+- ✅ **`result` events: 0** — confirms D8/Sharp #13 for Qwen too; run-finalize = `session_end`.
+- ⚠️ `stream_event` `goal_state` (1×) — **Qwen-only**, absent from every GigaCode trace.
+- ⚠️ Qwen `tool_use.id` = `call_function_<slug>_<n>` (e.g. `call_function_bdmxkuf50vbs_1`), **not** GigaCode's `call_<32 hex>`. Never regex-assume a shape — always key on the literal id string.
+- ⚠️ **9 events carry no `session_id` / `uuid` / `parent_tool_use_id`** — exactly the 5 `control_request` + 4 `control_response`, whose key sets are `{type,request,request_id}` and `{type,response}`. zod must make those three fields optional.
+- ✅ Qwen `assistant.message` has `stop_reason` + `usage` (GigaCode does not). Qwen `user.message` = `{role, content}`.
+- ✅ Qwen `thinking` blocks carry `signature`.
+- Tool inventory seen: `agent`(4), `run_shell_command`(3), `tool_call`(3 — MCP proxy, 3 in one message), `read_file`(2), `glob`(1), `edit`(1), `ask_user_question`(1), `tool_search`(1).
+- ✅ `<task-notification>` present 4× — with `<remaining>`/`<all-terminal>` but **no `<output-file>`** (GigaCode's variant has it). Task-id prefix `Explore` = the default `subagent_type` when omitted.
+
+**Fixture 2 — `gigacode.jsonl` — ✅ RESOLVED** (5 files, sessions `6cc302b9…`, `7f7459ef…`, `95698ef7…`, GigaCode **26.9.64** and **26.10.6**, model `vip/GLM-5.3`, `protocol_version=1`).
+- ✅ D7 holds hard: identical `session_start`/`session_end` envelope and identical `data` key set as Qwen.
+- ✅ `result` events: 0 across all 5403 + 12104 + 18 + 41 + 1652 lines.
+- 🔑 **`session_id` switches mid-stream on resume.** In `trace_mini_agents_tools.jsonl`, events 1–30 and the trailing `session_end` carry `95698ef7…` while events 31–40 carry `7f7459ef…` (the *original* session). → Group by the **envelope** session_id; **dedup replayed history by per-event `uuid`**.
+- 🔑 **Async `agent` + `<task-notification>`** (see D17). GigaCode's notification includes `<output-file>` and `<usage><total_tokens>`; Qwen's does not.
+- ✅ `agent` tool input = `{description, prompt, subagent_type}`; `subagent_type` free-form (`Explore`, `general-purpose`, 12 `sa-developer-*` types, `statusline-setup`). 15 `agent` blocks in ONE assistant message → never assume 1 tool_use/turn.
+- ✅ Error taxonomy (3 shapes): `permission_denied` = `Tool "X" is denied: …`; `runtime_error` = `Command: …\n<stderr>` (bash non-zero); `mcp_error` = `MCP tool 'X' reported tool error for function call: {…"isError":true…}`.
+- ✅ `user` events carry genuine user interjections (`content:[{type:"text"}]`) — must not be mistaken for tool results.
+- ⚠️ `tetrace_mini_mcp.jsonl` starts mid-stream with **zero `stream_event`** — truncated windows lose deltas. The session-log format has no deltas at all, so this failure mode disappears under F-026.
+
+**Hook research (Qwen Code 0.25.0, authoritative doc on disk):**
+`~/.npm-global/lib/node_modules/@qwen-code/qwen-code/bundled/qc-helper/docs/features/hooks.md` (1562 lines).
+- **16 events:** `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `SessionStart`, `SessionEnd`, `SessionDelete`, `MessageDisplay` (fires repeatedly as the reply streams), `Stop`, `SubagentStart`, `SubagentStop`, `PreCompact`, `Notification`, `PermissionRequest`, `PermissionDenied`, `TodoCreated`, `TodoCompleted`.
+- **4 executors:** `command` (JSON on stdin, JSON on stdout), `http` (JSON POST body), `function` (in-process JS, session scope only), `prompt` (LLM evaluation).
+- Command-hook fields: `type`, `command`, `name`, `description`, `timeout` (ms, default 60000), **`async`** (background), `env`, `shell`, **`statusMessage`** (rendered in the TUI).
+- **Common input payload: `{session_id, transcript_path, cwd, hook_event_name, timestamp}`** + per-event fields; sub-agent context adds `agent_id` + `agent_type`. `SessionStart` adds `{permission_mode: default|plan|auto_edit|yolo, source: startup|resume|clear|compact, model}` — **no json-file/fifo path**. `SessionEnd` adds `{reason: clear|logout|prompt_input_exit|bypass_permissions_disabled|other}`.
+- Exit codes: `0` = success (stdout parsed as JSON), `2` = **blocking error** (stderr → model), other = non-blocking. Output fields: `continue`, `stopReason`, `suppressOutput`, `systemMessage`, `decision`/`reason`, `hookSpecificOutput{hookEventName, additionalContext}`.
+- **HTTP hooks allow loopback by default** — SSRF protection explicitly permits `127.0.0.1` / `::1`; `security.allowPrivateNetworkHooks` is only needed for `10.x` / `172.16/12` / `192.168.x`. So a loopback HTTP hook needs no settings hack. (Not used — D1 — but it removes the friction that originally killed F-023.)
+- Global kill switch: top-level `"disableAllHooks": true`. Contract is forward-extensible ("consumers should ignore unknown fields") → all zod schemas `.passthrough()`.
+- Local layout confirmed: `~/.qwen/projects/<cwd-slug>/chats/<sid>.jsonl` (+ `.runtime.json`), `~/.qwen/projects/<cwd-slug>/subagents/<sid>/agent-*.jsonl` (+ `.meta.json`). `~/.qwen/settings.json` currently has **no `hooks` key**. `~/.qwen/sessions/` exists but is empty. No `~/.gigacode/` locally (corporate only).
+
+**Decisions (D2/D3 superseded by F-026; the rest stand):**
+
+| # | Decision | Status |
+|---|---|---|
+| D1 | JSON-stream is the only ingest mechanism. No `src/server.ts` HTTP listener. | ✅ stands (stream = session log per D13) |
+| D2 | FIFO is the primary transport. | ❌ **superseded by D12** |
+| D3 | `bridge watch` auto-spawned by the `SessionStart` hook, mkfifo `/tmp/agenttrace-qwen/$SESSION_ID.fifo`. | ❌ **superseded by D12** (auto-spawn still true; mkfifo dropped) |
+| D4 | Dual CLI: `bridge watch` (hook entrypoint) + `bridge tail <path>` (manual), same translator underneath. | ✅ stands — add `bridge replay <wire.jsonl>` (D13) |
+| D5 | `bridge install` patches `~/.qwen/settings.json` to register the `SessionStart` hook (backup + interactive confirm); README snippet for manual paste. | ✅ stands |
+| D6 | One `agent_provider` discriminator: `qwen_code` / `gigacode`; `--provider` overrides. | ✅ stands, detection rule now specified in **D19** |
+| D7 | **Single JSONL schema for Qwen and GigaCode.** Both emit `{"type":"system","subtype":"session_start"}` and `session_end`. | ✅ **re-confirmed 2026-10-20** on GigaCode 26.10.6 |
+| D8 | TUI-only mode; no headless path. Live smoke requires Kolya; CI uses fixtures. | ✅ stands |
+| D9 | HTTP-bridge `:5898` deferred indefinitely. | ✅ stands — and D12 makes it moot |
+| D10 | Sub-agent visibility default: parent-only; separate-file tailing was a HYPOTHESIS. | ✅ **HYPOTHESIS CONFIRMED → promoted to D14** (separate files exist, with a `.meta.json` parent link) |
+| D11 | Ship to `:5899/v1/` (agenttrace daemon) using the **OpenCode-plugin wire format**. Zero daemon-side adapter beyond `agent_provider`. | ✅ stands |
+| D12–D19 | *(see F-026)* | 🆕 |
+
+**Out of scope (this iteration):** any HTTP server; `handler-qwen.ts` / `handler-gigacode.ts`; an OTLP receiver in agenttrace.
+
+**Files to create (no code yet — repo is still scaffold-only):**
+- `src/cli.ts` — bin with `watch`, `tail`, `replay`, `install`, `uninstall`.
+- `src/session-watch.ts` — `SessionStart` stdin reader → resolve `transcript_path` → hand off to tail in-process; exits on `SessionEnd` hook or `pid` death.
+- `src/tail.ts` — offset-tracked incremental file reader → zod → translator.
+- `src/session-log.ts` — canonical zod schemas (F-026).
+- `src/wire-jsonl.ts` — best-effort zod schemas for the `--json-file` replay format.
+- `src/subagents.ts` — lazy-`subagents/` watcher + `.meta.json` parsing.
+- `src/translator.ts` — pure fn: 1 session-log event → 1..n spans (stateful across a turn: the `agent` span stays open until its `<task-notification>`).
+- `src/shipper.ts` — POST `localhost:5899/v1/`, backoff on 429.
+- `src/config.ts` — `WORKSHOP_URL` + `isLocalUrl()` guard (F-005 plugin pattern).
+- `src/logger.ts`, `src/install.ts`.
+- `tests/{session-log,translator,tail,shipper,subagents,install}.test.ts`; `.github/workflows/ci.yml`.
+
+**Todos (order matters — F-026 items first):**
+- [ ] Answer Q1–Q4 below (Kolya's data / corporate answers).
+- [ ] `src/session-log.ts` + `tests/session-log.test.ts` green against the on-disk corpus.
+- [ ] `ai-docs/specs/F-026-session-log-format.md`.
+- [ ] `src/subagents.ts` + `tests/subagents.test.ts`.
+- [ ] `src/translator.ts` — spans for: user turn, assistant reasoning, assistant text, tool call/result, **deferred `agent` span closed by `<task-notification>`**, run-level totals. Unit tests on the on-disk corpus.
+- [ ] `src/tail.ts` — synthetic file-append test proving incremental read + dedup-by-uuid.
+- [ ] `src/shipper.ts` — mocked HTTP, 429 backoff, `WORKSHOP_URL=evil.com` rejected.
+- [ ] `src/session-watch.ts` — stdin parse → tail handoff.
+- [ ] `src/install.ts` — dry-run + real patch of `~/.qwen/settings.json`, backup, idempotent.
+- [ ] `src/wire-jsonl.ts` + `bridge replay` — best-effort, non-blocking.
+- [ ] `src/cli.ts` wiring.
+- [ ] `README.md`; `.github/workflows/ci.yml`.
+- [ ] Commit the fixture corpus to `tests/fixtures/` (needs Q8).
+- [ ] **Live smoke A (Kolya, TUI):** `bridge tail ~/.qwen/projects/<slug>/chats/<sid>.jsonl` in tmux pane B → work in pane A → verify `sqlite3 ~/.raindrop/raindrop_workshop.db "SELECT id, json_extract(metadata,'$.agent_provider'), span_count FROM runs ORDER BY last_updated_at DESC LIMIT 3"`.
+- [ ] **Live smoke B (Kolya, TUI):** same after `bridge install` — zero manual invocation, sub-agent spans appear nested under their `agent` tool span.
+- [ ] **Live smoke C (Kolya, corporate):** repeat A on the GigaCode machine (needs Q1/Q2 answers).
+
+**Cross-repo impact (unchanged):** `agenttrace-opencode-plugin` — **no change**. `agenttrace` — minimal: read `agent_provider`, UI source badge + facet.
 
 ### F-024 — Rename stack: `openworkshop-qwen-bridge` → `agenttrace-qwen-bridge`
 
-**Context:** Companion rename to the umbrella stack rename (F-024 in `opencode-workshop` and `opencode-workshop-plugin`). As of 2026-09-17 this bridge repo is renamed from `openworkshop-qwen-bridge` → `agenttrace-qwen-bridge` to align with the agenttrace identity.
+**Context:** Companion rename to the umbrella stack rename (F-024 in `opencode-workshop` and `opencode-workshop-plugin`). As of 2026-09-17 this bridge repo is renamed to align with the agenttrace identity.
 
-**Files to edit:**
-- `package.json` — `name`, `bin`, `description`, `homepage`, `bugs.url`, `repository.url`, `keywords`
-- `README.md` — title, install command, description, public package links
-- `AGENTS.md` — title, sibling-repo table, public package block, hard-rules wording, Quick Reference
-- `ai-docs/PLAN.md` — title + Roadmap + F-023 description + F-024 entry
+**Files to edit:** `package.json` (name/bin/description/homepage/bugs/repository/keywords), `README.md`, `AGENTS.md`, `ai-docs/PLAN.md`.
 
-**Out of scope:**
-- `ai-docs/specs/handoff/F-023-corporate-handshake.md` — archived to `ai-docs/specs/archive/F-023-corporate-handshake.md` (superseded by F-025 JSONL architecture, old paths and HTTP-hook design).
-- Remote push (`git remote add origin` + `git push`) — Kolya action.
+**Out of scope:** `ai-docs/specs/handoff/F-023-corporate-handshake.md` — archived to `ai-docs/specs/archive/` (superseded by F-025/F-026). Remote push — Kolya action.
 
-**Deferred to separate Kolya-authorized steps:**
-- `npm publish @grudanov-nikolay/agenttrace-qwen-bridge@<future>`
-- `gh repo create nikolay-grudanov/agenttrace-qwen-bridge --public` (first push to a brand-new remote)
+**Deferred to separate Kolya-authorized steps:** `npm publish @grudanov-nikolay/agenttrace-qwen-bridge@<future>`; `gh repo create nikolay-grudanov/agenttrace-qwen-bridge --public` + first push.
 
 **Todos:**
 - [x] `package.json` — name, bin, description, homepage, bugs.url, repository.url, keywords
@@ -174,39 +237,35 @@ New confirmed facts from `trace_2.json.txt`:
 
 ### F-023 — Bridge for Qwen Code + GigaCode → agenttrace daemon
 
-**Status:** Superseded by F-025 (architecture flip). All Stages 1-3 below to be re-scoped under F-025's file list. Original umbrella proposal remains at `~/workspase/projects/agenttrace-stack/agenttrace/openspec/changes/archive/F-023-multi-source-ingestion/proposal.md` for historical reference.
+**Status:** Superseded by F-025 → F-026. Kept for audit trail. Original umbrella proposal: `~/workspase/projects/agenttrace-stack/agenttrace/openspec/changes/archive/F-023-multi-source-ingestion/proposal.md`.
 
-**Original repo-local scope (kept for audit trail, not active):**
-- `src/server.ts` — stdlib HTTP server on `127.0.0.1:5898`, routes `/qwen/hook`, `/gigacode/hook`, `/health`, `/ready`. (Replaced by `src/tail.ts` per F-025 D1.)
-- `src/handler-qwen.ts` — Qwen Code `PreToolUse`/`PostToolUse`/`Stop`/`SubagentStop` → translator. (Replaced by `src/translator.ts` reading JSONL events per F-025.)
-- `src/handler-gigacode.ts` — placeholder stub for the wire contract (corporate agent fills in real handler against `ai-docs/specs/F-023-wire-contract.md`). (Replaced by shared zod schema in `src/wire-format.ts` per F-025 D7.)
-- `src/translator.ts` — pure function, hook event → Workshop-span shape. (Reused as-is in F-025.)
-- `src/wire-format.ts` — zod schemas (Qwen input + Workshop output). (Expanded per F-025 D7.)
-- `src/shipper.ts` — POSTs translated spans to `localhost:5899/v1/` (re-uses OpenCode-plugin wire format). (Reused as-is in F-025.)
-- `src/config.ts` — env-var loader with `isLocalUrl()` guard (F-005 pattern from plugin). (Reused as-is in F-025.)
-- `src/logger.ts` — leveled logger. (Reused as-is in F-025.)
-- `tests/handler-qwen.test.ts` — 6+ unit tests on translated output. (Replaced by `tests/translator.test.ts`.)
-- `tests/wire-format.test.ts` — round-trip zod tests. (Kept and expanded.)
-- `tests/shipper.test.ts` — HTTP mocking. (Kept.)
-- `ai-docs/specs/F-023-wire-contract.md` — canonical document for the corporate GigaCode author. (Renamed/replaced by `ai-docs/specs/F-025-wire-contract.md` per F-025.)
-- `.github/workflows/ci.yml` — `tsc --noEmit` + `node --test`. (Kept.)
+**Original repo-local scope (superseded):** `src/server.ts` `:5898` HTTP listener, `handler-qwen.ts`, `handler-gigacode.ts`, `translator.ts`, `wire-format.ts`, `shipper.ts`, `config.ts`, `logger.ts`, `handler-qwen.test.ts`, `F-023-wire-contract.md`.
 
-**Cross-repo impact:**
-- **No changes** to `agenttrace-opencode-plugin` (the bridge impersonates its wire format).
-- **Minimal changes** to `agenttrace`: read `agent_provider` field, UI source badge + facet (handled by umbrella workshop's F-023 entry).
+**Cross-repo impact:** no changes to `agenttrace-opencode-plugin`; minimal changes to `agenttrace` (read `agent_provider`, UI badge).
 
-**Todos (Stage 0 only — repo bootstrap, in progress 2026-09-17):**
-- [x] Create repo at `~/workspase/projects/agenttrace-qwen-bridge/` (originally scaffolded as `openworkshop-qwen-bridge`, renamed 2026-09-17 F-024)
-- [x] Write `package.json` (npm namespace `@grudanov-nikolay/agenttrace-qwen-bridge`)
-- [x] Write `tsconfig.json` (strict, ES2022)
-- [x] Write `.gitignore` (node_modules/, dist/, .zcode/, .env)
-- [x] Write `LICENSE` (dual copyright Raindrop AI + Nikolai Grudanov)
-- [x] Write `README.md` (minimal pointer)
-- [x] Write `AGENTS.md` (within-repo)
-- [x] Write `ai-docs/PLAN.md` (this file)
+**Todos (Stage 0 repo bootstrap):**
+- [x] Create repo (originally `openworkshop-qwen-bridge`, renamed 2026-09-17 F-024)
+- [x] `package.json` (npm namespace `@grudanov-nikolay/agenttrace-qwen-bridge`)
+- [x] `tsconfig.json` (strict, ES2022), `.gitignore`, `LICENSE`, `README.md`, `AGENTS.md`, `ai-docs/PLAN.md`
 - [ ] Update umbrella `~/workspase/projects/agenttrace-stack/AGENTS.md` to reference this repo
 - [ ] `git init` + first commit (requires Kolya's «приступай»)
-- [ ] Publish to npm `0.0.1` (after live smoke test, requires Kolya's `npm publish`)
+- [ ] Publish to npm (after live smoke, Kolya action)
+
+## Open questions — data needed from Kolya (2026-10-20)
+
+**Q1 (blocking, corporate).** Does GigaCode 26.10.6 also persist `~/.gigacode/projects/<slug>/chats/<sid>.jsonl` in the **same** session-log format, or only the `--json-file` stream? → If yes: **one** translator, F-026 covers both providers. If no: F-027 splits into two translators.
+**Q2 (blocking, corporate).** Does GigaCode support `SessionStart` hooks, and does the payload carry `transcript_path`? If not, the corporate install falls back to `--json-file <fifo>` (old D2/D3).
+**Q3 (nice-to-have, corporate).** Do GigaCode sub-agent files have the `.meta.json` sidecar with `parentSessionId` / `toolUseId` / `parentAgentId`?
+**Q4 (blocking for F-013 parity).** How does a **permission denial / tool failure** appear in the *session-log* format? Every one of the 16 `toolCallResult` in the Qwen fixture is `status:"success"`. Need any real chat log containing `status:"error"` / `executionStatus:"error"` / `shell_result.error != null` / `exitCode != 0`, plus the `control_request`-denied path (which does not exist in this format at all).
+**Q5 (verification, 2 minutes).** Confirm that `transcript_path` in the actual `SessionStart` hook payload really points at `~/.qwen/projects/<slug>/chats/<sid>.jsonl`. Drop this in `~/.qwen/settings.json` and run one TUI session:
+```json
+{"hooks":{"SessionStart":[{"matcher":"*","hooks":[{"type":"command","name":"at-probe","command":"tee /tmp/at-hook.json","statusMessage":"agenttrace probe"}]}]}}
+```
+Then `cat /tmp/at-hook.json`.
+**Q6 (verification, 1 minute).** Confirm an `async: true` command hook does not block the TUI and that its stdout is ignored. Same snippet with `"async": true` and `"timeout": 5000`.
+**Q7 (nice-to-have).** A **nested** sub-agent session (`depth ≥ 1`, `parentAgentId != null`) to validate recursive attach — `persistedCliFlags.maxSubagentDepth` is 5, but all four captured sub-agents are `depth: 0`.
+**Q8 (needed for CI).** OK to commit the fixture corpus into `tests/fixtures/`? Concretely: `test_trace_json_file.json` (203 KB), `~/.qwen/projects/-home-gna-workspase-projects-agenttrace-qwen-bridge/chats/3d983425-*.jsonl` (399 KB), its 4 `agent-*.jsonl` (27–98 KB) + 4 `.meta.json`, and the 5 GigaCode files from `private-work-staff/json_ggcode/`. Redact or confirm as-is.
+**Q9 (nice-to-have).** A **tool-error** Qwen chat log and a `thinking`-heavy log, so the reasoning-span path and the F-013 `status=ERROR` mapping get real fixtures rather than synthetic ones.
 
 ## Closed Features
 
@@ -214,4 +273,4 @@ _(none yet — this repo is brand new)_
 
 ---
 
-*Maintained by Miko (Hermes Agent) under Kolya's direction. Update this file when the repo state changes meaningfully. The 2026-09-18 architecture flip (HTTP-bridge → JSON-stream + SessionStart-hook wrapper) was discussed live with Kolya; F-025 captures the decisions so future sessions can pick up from here without re-litigating.*
+*Maintained by Miko (Hermes Agent) under Kolya's direction. 2026-09-18 architecture flip (HTTP-bridge → JSON-stream + SessionStart hook) recorded in F-025. 2026-10-20 corpus analysis (Qwen 0.25.0 wire + session log, GigaCode 26.9.64 / 26.10.6 wire, full hooks doc) recorded in F-026 — the ingest source moved from `--json-file` to the session log, which is strictly richer and needs no FIFO.*
